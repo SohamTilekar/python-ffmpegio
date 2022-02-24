@@ -153,3 +153,4 @@ docs/
 
 sandbox/*
 !sandbox/*.py
+!sandbox/*.xml
