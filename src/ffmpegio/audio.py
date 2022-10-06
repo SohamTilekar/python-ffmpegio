@@ -1,15 +1,22 @@
 """Audio Read/Write Module
 """
 
+import warnings
 from . import ffmpegprocess, utils, configure, FFmpegError, probe, plugins, analyze
-from .utils import filter as filter_utils, log as log_utils
+from .utils import log as log_utils
 import logging
 
 __all__ = ["create", "read", "write", "filter", "detect"]
 
 
 def _run_read(
-    *args, sample_fmt_in=None, ac_in=None, ar_in=None, show_log=None, **kwargs
+    *args,
+    sample_fmt_in=None,
+    ac_in=None,
+    ar_in=None,
+    show_log=None,
+    sp_kwargs=None,
+    **kwargs,
 ):
     """run FFmpeg and retrieve audio stream data
     :param *args ffmpegprocess.run arguments
@@ -24,6 +31,10 @@ def _run_read(
                      defaults to None (no show/capture)
                      Ignored if stream format must be retrieved automatically.
     :type show_log: bool, optional
+    :param sp_kwargs: dictionary with keywords passed to `subprocess.run()` or
+                      `subprocess.Popen()` call used to run the FFmpeg, defaults
+                      to None
+    :type sp_kwargs: dict, optional
     :param **kwargs ffmpegprocess.run keyword arguments
     :type **kwargs: tuple
     :return: [description]
@@ -41,6 +52,9 @@ def _run_read(
     dtype, ac, rate = configure.finalize_audio_read_opts(
         args[0], sample_fmt_in, ac_in, ar_in
     )
+
+    if sp_kwargs is not None:
+        kwargs = {**sp_kwargs, **kwargs}
 
     if dtype is None or ac is None or rate is None:
         configure.clear_loglevel(args[0])
@@ -69,87 +83,82 @@ def _run_read(
     )
 
 
-def create(
-    expr,
-    *args,
-    progress=None,
-    show_log=None,
-    t_in=None,
-    ar=None,
-    ac=None,
-    sample_fmt=None,
-    af=None,
-    **kwargs,
-):
+def create(expr, *args, progress=None, show_log=None, sp_kwargs=None, **options):
     """Create audio data using an audio source filter
 
     :param expr: name of the source filter or full filter expression
     :type expr: str
-    :param \\*args: filter arguments
-    :type \\*args: tuple, optional
+    :param \\*args: sequential filter option arguments. Only valid for
+                    a single-filter expr, and they will overwrite the
+                    options set by expr.
+    :type \\*args: seq, optional
     :param progress: progress callback function, defaults to None
     :type progress: callable object, optional
     :param show_log: True to show FFmpeg log messages on the console,
                      defaults to None (no show/capture)
                      Ignored if stream format must be retrieved automatically.
     :type show_log: bool, optional
-    :param t_in: duration of the video in seconds, defaults to None
-    :type t_in: float, optional
-    :param ar: sampling rate in samples/second, defaults to None
-    :type ar: int, optional
-    :param ac: number of channels, defaults to None
-    :type ac: int, optional
-    :param sample_fmt: sample format, defaults to None
-    :type sample_fmt: str, optional
-    :param af: additional filter, defaults to None
-    :type af: FilterGraph or str, optional
-    :param \\**options: FFmpeg options (see :doc:`options`)
+    :param sp_kwargs: dictionary with keywords passed to `subprocess.run()` or
+                      `subprocess.Popen()` call used to run the FFmpeg, defaults
+                      to None
+    :type sp_kwargs: dict, optional
+    :param \\**options: Named filter options or FFmpeg options. Items are
+                        only considered as the filter options if expr is a
+                        single-filter graph, and take the precedents over
+                        general FFmpeg options. Append '_in' for input
+                        option names (see :doc:`options`), and '_out' for
+                        output option names if they conflict with the filter
+                        options.
     :type \\**options: dict, optional
-    :return: sampling rate and audio data
+    :return: sampling rate and audio data (a plugin may change this behavior
+             with the `bytes_to_audio` hook.)
     :rtype: tuple[int, object]
 
-    .. note:: Either `duration` or `nb_samples` filter options must be set.
+    .. seealso::
+        https://ffmpeg.org/ffmpeg-filters.html#Audio-Sources for available
+        audio source filters
 
-    See https://ffmpeg.org/ffmpeg-filters.html#Audio-Sources for available video source filters
+    .. warning::
+        Nearly all the source filters by default continue outputting
+        indefinitely. Set its  `duration` option or FFmpeg's `t` (duration)
+        or `to` (end time) input/output options to make sure the function
+        returns properly.
 
-    ouptut data object is determined by the selected `bytes_to_audio` hook
+    .. note::
+        output data object is determined by the selected  hook
 
     """
 
-    url, (ar_in, ac_in) = filter_utils.compose_source("audio", expr, *args, **kwargs)
+    input_options = utils.pop_extra_options(options, "_in")
+    output_options = utils.pop_extra_options(options, "_out")
+    url, t_, options = configure.config_input_fg(expr, args, options)
+    options = {**options, **output_options}
 
-    if sample_fmt is None:
-        sample_fmt = "dbl"
-
-    # need_t = ("mandelbrot", "life")
-    # if t_in is None and any((expr.startswith(f) for f in need_t)):
-    #     raise ValueError(f"Some sources {need_t} must have t_in specified")
+    if (
+        t_ is None
+        and not any(a in input_options for a in ("t", "to"))
+        and not any(a in options for a in ("t", "to", "frames:a", "aframes"))
+    ):
+        warnings.warn(
+            "neither input nor output duration specified. this function call may hang."
+        )
 
     ffmpeg_args = configure.empty()
-    inopts = configure.add_url(ffmpeg_args, "input", url, {"f": "lavfi"})[1][1]
-    outopts = configure.add_url(ffmpeg_args, "output", "-", {})[1][1]
-
-    if t_in:
-        inopts["t"] = t_in
-
-    for k, v in zip(
-        ("ar", "ac", "sample_fmt", "filter:a"),
-        (ar or ar_in, ac or ac_in, sample_fmt, af),
-    ):
-        if v is not None:
-            outopts[k] = v
+    inopts = configure.add_url(
+        ffmpeg_args, "input", url, {**input_options, "f": "lavfi"}
+    )[1][1]
+    configure.add_url(ffmpeg_args, "output", "-", options)[1][1]
 
     return _run_read(
         ffmpeg_args,
-        sample_fmt_in=sample_fmt,
-        ac_in=ac_in,
-        ar_in=ar_in,
-        show_log=show_log,
+        sample_fmt_in=inopts.get("sample_fmt", "dbl"),
         progress=progress,
+        show_log=show_log,
+        sp_kwargs=sp_kwargs,
     )
 
 
-def read(url, progress=None, show_log=None, **options):
+def read(url, progress=None, show_log=None, sp_kwargs=None, **options):
     """Read audio samples.
 
     :param url: URL of the audio file to read.
@@ -160,6 +169,10 @@ def read(url, progress=None, show_log=None, **options):
                      defaults to None (no show/capture)
                      Ignored if stream format must be retrieved automatically.
     :type show_log: bool, optional
+    :param sp_kwargs: dictionary with keywords passed to `subprocess.run()` or
+                      `subprocess.Popen()` call used to run the FFmpeg, defaults
+                      to None
+    :type sp_kwargs: dict, optional
     :param \\**options: FFmpeg options, append '_in' for input option names (see :doc:`options`)
     :type \\**options: dict, optional
     :return: sample rate in samples/second and audio data object specified by `bytes_to_audio` plugin hook
@@ -195,15 +208,19 @@ def read(url, progress=None, show_log=None, **options):
     configure.add_url(ffmpeg_args, "input", url, input_options)[1][1]
     configure.add_url(ffmpeg_args, "output", "-", options)[1][1]
 
+    # override user specified stdin and input if given
+    sp_kwargs = {**sp_kwargs} if sp_kwargs else {}
+    sp_kwargs["stdin"] = stdin
+    sp_kwargs["input"] = input
+
     return _run_read(
         ffmpeg_args,
-        stdin=stdin,
-        input=input,
         sample_fmt_in=sample_fmt,
         ac_in=ac_in,
         ar_in=ar_in,
         progress=progress,
         show_log=show_log,
+        sp_kwargs=sp_kwargs,
     )
 
 
@@ -215,6 +232,7 @@ def write(
     overwrite=None,
     show_log=None,
     extra_inputs=None,
+    sp_kwargs=None,
     **options,
 ):
     """Write a NumPy array to an audio file.
@@ -236,6 +254,10 @@ def write(
     :param extra_inputs: list of additional input sources, defaults to None. Each source may be url
                          string or a pair of a url string and an option dict.
     :type extra_inputs: seq(str|(str,dict))
+    :param sp_kwargs: dictionary with keywords passed to `subprocess.run()` or
+                      `subprocess.Popen()` call used to run the FFmpeg, defaults
+                      to None
+    :type sp_kwargs: dict, optional
     :param \\**options: FFmpeg options, append '_in' for input option names (see :doc:`options`)
     :type \\**options: dict, optional
     """
@@ -260,19 +282,33 @@ def write(
 
     configure.add_url(ffmpeg_args, "output", url, options)
 
-    out = ffmpegprocess.run(
-        ffmpeg_args,
-        input=plugins.get_hook().audio_bytes(obj=data),
-        stdout=stdout,
-        progress=progress,
-        overwrite=overwrite,
-        capture_log=None if show_log else True,
+    kwargs = {**sp_kwargs} if sp_kwargs else {}
+    kwargs.update(
+        {
+            "input": plugins.get_hook().audio_bytes(obj=data),
+            "stdout": stdout,
+            "progress": progress,
+            "overwrite": overwrite,
+        }
     )
+    if show_log:
+        kwargs["capture_log"] = True
+
+    out = ffmpegprocess.run(ffmpeg_args, **kwargs)
     if out.returncode:
         raise FFmpegError(out.stderr, show_log)
 
 
-def filter(expr, input_rate, input, progress=None, sample_fmt=None, **options):
+def filter(
+    expr,
+    input_rate,
+    input,
+    sample_fmt=None,
+    progress=None,
+    show_log=None,
+    sp_kwargs=None,
+    **options,
+):
     """Filter audio samples.
 
     :param expr: SISO filter graph.
@@ -283,6 +319,13 @@ def filter(expr, input_rate, input, progress=None, sample_fmt=None, **options):
     :type input: object
     :param progress: progress callback function, defaults to None
     :type progress: callable object, optional
+    :param show_log: True to show FFmpeg log messages on the console,
+                     defaults to None (no show/capture)
+    :type show_log: bool, optional
+    :param sp_kwargs: dictionary with keywords passed to `subprocess.run()` or
+                      `subprocess.Popen()` call used to run the FFmpeg, defaults
+                      to None
+    :type sp_kwargs: dict, optional
     :param \\**options: FFmpeg options, append '_in' for input option names (see :doc:`options`)
     :type \\**options: dict, optional
     :return: output sampling rate and audio data object, created by `bytes_to_audio` plugin hook
@@ -306,6 +349,7 @@ def filter(expr, input_rate, input, progress=None, sample_fmt=None, **options):
         ffmpeg_args,
         input=plugins.get_hook().audio_bytes(obj=input),
         progress=progress,
+        show_log=show_log,
     )
 
 
@@ -371,7 +415,7 @@ def detect(
              - 'interval'
              - (numeric, numeric)
              - (only if mono=False) Silent interval
-           * - 
+           * -
              - 'chX'
              - (numeric, numeric)
              - (only if mono=True) Silent interval of channel X (multiple)
